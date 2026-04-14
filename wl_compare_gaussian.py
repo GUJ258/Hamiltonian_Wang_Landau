@@ -1,0 +1,745 @@
+"""
+WL-RDW vs WL-DHMC Comparison
+=============================
+4 plots:
+  1. Density of States
+  2. Convergence (MSE)
+  3. f-Reduction Timeline (steps per stage)
+  4. Summary table: U/step and time/step
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import gamma as gamma_dist
+from numba import njit
+import time
+
+
+# =============================================================================
+# Shared: Potential
+# =============================================================================
+
+@njit(cache=True)
+def _U_flat(r_flat, N, D):
+    sum_sq = 0.0
+    sum_r  = np.zeros(D)
+    for i in range(N):
+        sq = 0.0
+        for d in range(D):
+            v        = r_flat[i * D + d]
+            sq      += v * v
+            sum_r[d] += v
+        sum_sq += sq
+    sum_r_sq = 0.0
+    for d in range(D):
+        sum_r_sq += sum_r[d] * sum_r[d]
+    return sum_sq + (0.5 / N) * (N * sum_sq - sum_r_sq)
+
+
+@njit(cache=True)
+def _grad_U_particle(r_flat, N, D, i):
+    mean_r = np.zeros(D)
+    for k in range(N):
+        for d in range(D):
+            mean_r[d] += r_flat[k * D + d]
+    for d in range(D):
+        mean_r[d] /= N
+    g = np.empty(D)
+    for d in range(D):
+        g[d] = 3.0 * r_flat[i * D + d] - mean_r[d]
+    return g
+
+
+def U(r):
+    return _U_flat(r.ravel(), r.shape[0], r.shape[1])
+
+
+# =============================================================================
+# Shared: Bin helper
+# =============================================================================
+
+@njit(cache=True, inline='always')
+def _bin_index(E, E_min, dE, n_bins):
+    if E < E_min or E > E_min + dE * n_bins:
+        return -1
+    k = int((E - E_min) / dE)
+    return min(k, n_bins - 1)
+
+
+# =============================================================================
+# Shared: Energy range + initial config
+# =============================================================================
+
+def estimate_energy_range(N, D, low_q=0.005, high_q=0.995,
+                           e_min_floor=0.5, n_fit=5000, seed=0):
+    n, shape = N * D, N * D / 2.0
+    rng   = np.random.default_rng(seed)
+    pilot = np.array([U(rng.standard_normal((N, D))) for _ in range(n_fit)])
+    theta = pilot.mean() / shape
+    e_min = max(e_min_floor, float(gamma_dist.ppf(low_q,  shape, scale=theta)))
+    e_max = float(gamma_dist.ppf(high_q, shape, scale=theta))
+    print(f"Energy range: [{e_min:.3f}, {e_max:.3f}]  "
+          f"(U ~ Gamma(shape={shape:.1f}, scale={theta:.4f}))")
+    return e_min, e_max
+
+
+def find_initial_config(N, D, e_min, e_max, n_tries=100_000, seed=1):
+    rng = np.random.default_rng(seed)
+    for trial in range(n_tries):
+        scale = 0.05 + 3.0 * (trial / n_tries)
+        r = rng.standard_normal((N, D)) * scale
+        if e_min <= U(r) < e_max:
+            print(f"Initial config: trial={trial+1}  U={U(r):.4f}")
+            return r
+    raise RuntimeError("Could not find initial config.")
+
+
+# =============================================================================
+# RDW helpers (Numba)
+# =============================================================================
+
+@njit(cache=True)
+def _U_single_particle(r_i_new, sum_sq_others, sum_r_others, N, D):
+    sq_i = 0.0
+    for d in range(D):
+        sq_i += r_i_new[d] * r_i_new[d]
+    sum_sq = sum_sq_others + sq_i
+    sum_r_sq = 0.0
+    for d in range(D):
+        s = sum_r_others[d] + r_i_new[d]
+        sum_r_sq += s * s
+    return sum_sq + (0.5 / N) * (N * sum_sq - sum_r_sq)
+
+
+@njit(cache=True)
+def _init_sums(r_flat, N, D):
+    sum_sq = 0.0
+    sum_r  = np.zeros(D)
+    for k in range(N):
+        for d in range(D):
+            v = r_flat[k * D + d]
+            sum_sq   += v * v
+            sum_r[d] += v
+    return sum_sq, sum_r
+
+
+@njit(cache=True)
+def _rdw_step(r_flat, e, log_g, e_min, dE, n_bins,
+              N, D, step_size, rand_i, rand_delta, rand_u, sum_sq, sum_r):
+    i = rand_i
+    sq_i_old = 0.0
+    r_i_old  = np.empty(D)
+    for d in range(D):
+        v = r_flat[i * D + d]
+        r_i_old[d] = v
+        sq_i_old  += v * v
+    sum_sq_others = sum_sq - sq_i_old
+    sum_r_others  = np.empty(D)
+    for d in range(D):
+        sum_r_others[d] = sum_r[d] - r_i_old[d]
+    r_i_new = np.empty(D)
+    for d in range(D):
+        r_i_new[d] = r_i_old[d] + rand_delta[d] * step_size
+    e_new = _U_single_particle(r_i_new, sum_sq_others, sum_r_others, N, D)
+    k_old = _bin_index(e,     e_min, dE, n_bins)
+    k_new = _bin_index(e_new, e_min, dE, n_bins)
+    accepted = False
+    if k_new >= 0:
+        if np.log(rand_u) < log_g[k_old] - log_g[k_new]:
+            for d in range(D):
+                r_flat[i * D + d] = r_i_new[d]
+            e = e_new
+            accepted = True
+            sq_i_new = 0.0
+            for d in range(D):
+                sq_i_new += r_i_new[d] * r_i_new[d]
+            sum_sq = sum_sq_others + sq_i_new
+            for d in range(D):
+                sum_r[d] = sum_r_others[d] + r_i_new[d]
+    return r_flat, e, accepted, sum_sq, sum_r
+
+
+# =============================================================================
+# WL-RDW
+# =============================================================================
+
+def wang_landau_rdw(r_init, e_min, e_max, n_bins,
+                    step_size, log_f_init, log_f_final,
+                    flatness, check_interval, seed):
+    rng  = np.random.default_rng(seed)
+    r    = r_init.copy()
+    N, D = r.shape
+    e    = U(r)
+    dE   = (e_max - e_min) / n_bins
+
+    log_g    = np.zeros(n_bins)
+    hist_f   = np.zeros(n_bins, dtype=np.int64)
+    hist_all = np.zeros(n_bins, dtype=np.int64)
+
+    centers = np.array([e_min + (k + 0.5) * dE for k in range(n_bins)])
+    dof     = N * D
+    vmask   = centers > 0
+    theory  = (dof / 2.0 - 1.0) * np.log(centers[vmask])
+    theory -= theory.min()
+
+    log_f        = float(log_f_init)
+    stage        = 0
+    total_steps  = 0
+    accepted     = 0
+    mse_history  = []
+    log_g_history= []
+    current_bin  = _bin_index(e, e_min, dE, n_bins)
+    steps_in_bin = 1
+
+    # per-stage diagnostics
+    stage_steps = []   # steps per stage
+    stage_times = []   # seconds per stage
+    u_per_step  = 1.0  # RDW always 1 U call per step
+
+    r_flat = r.ravel().copy()
+    sum_sq, sum_r = _init_sums(r_flat, N, D)
+
+    t0 = time.time()
+    print(f"\n{'='*60}")
+    print(f"WL-RDW  N={N}  D={D}  step={step_size}")
+    print(f"  E=[{e_min:.3f}, {e_max:.3f}]  bins={n_bins}  dE={dE:.4f}")
+    print(f"  log_f: {log_f_init} -> {log_f_final}  "
+          f"flatness={flatness}  check_interval={check_interval:,}")
+    print(f"{'='*60}")
+
+    while log_f > log_f_final:
+        print(f"Stage {stage}: log_f = {log_f:.6f}")
+        hist_f[:] = 0
+        steps_this_stage    = 0
+        accepted_this_stage = 0
+        stay_lengths        = []
+        t_stage = time.time()
+
+        while True:
+            i          = int(rng.integers(N))
+            rand_delta = rng.standard_normal(D)
+            rand_u     = rng.random()
+
+            r_flat, e, acc, sum_sq, sum_r = _rdw_step(
+                r_flat, e, log_g, e_min, dE, n_bins,
+                N, D, step_size, i, rand_delta, rand_u, sum_sq, sum_r)
+
+            if acc:
+                accepted            += 1
+                accepted_this_stage += 1
+
+            k = _bin_index(e, e_min, dE, n_bins)
+            if k >= 0:
+                log_g[k]   += log_f
+                hist_f[k]  += 1
+                hist_all[k]+= 1
+
+            total_steps      += 1
+            steps_this_stage += 1
+
+            if k >= 0 and k != current_bin:
+                stay_lengths.append(steps_in_bin)
+                current_bin  = k
+                steps_in_bin = 1
+            else:
+                steps_in_bin += 1
+
+            lg = log_g[vmask] - log_g[vmask].min()
+            mse_history.append(float(np.mean((lg - theory) ** 2)))
+
+            if steps_this_stage % check_interval == 0:
+                visited  = hist_f[hist_f > 0]
+                h_min    = int(visited.min()) if len(visited) else 0
+                h_mean   = float(visited.mean()) if len(visited) else 0.0
+                ratio    = h_min / h_mean if h_mean > 0 else 0.0
+                avg_stay = float(np.mean(stay_lengths)) if stay_lengths else float(steps_in_bin)
+                elapsed  = time.time() - t0
+                print(f"  iter {total_steps:>10,} | Hmin {h_min} | "
+                      f"ratio {ratio:.3f} | accept {accepted_this_stage/steps_this_stage:.3f} | "
+                      f"avg_stay {avg_stay:.1f} | MSE {mse_history[-1]:.4f} | "
+                      f"U/step 1.0 | t {elapsed:.1f}s")
+                if ratio >= flatness:
+                    print(f"  >> Stage {stage} passed.")
+                    log_g_history.append(log_g.copy())
+                    break
+
+        stage_steps.append(steps_this_stage)
+        stage_times.append(time.time() - t_stage)
+        log_f /= 2.0
+        stage  += 1
+
+    r = r_flat.reshape(N, D)
+    total_time = time.time() - t0
+    print(f"Done. stages={stage}  steps={total_steps:,}  time={total_time:.1f}s")
+    return {
+        "log_g"       : log_g,
+        "hist_all"    : hist_all,
+        "mse_history" : np.array(mse_history),
+        "centers"     : centers,
+        "total_steps" : total_steps,
+        "total_time"  : total_time,
+        "stage"       : stage,
+        "stage_steps" : stage_steps,
+        "stage_times" : stage_times,
+        "u_per_step"  : u_per_step,
+        "label"       : f"RDW  step={step_size}",
+    }
+
+
+# =============================================================================
+# DHMC internals (Numba)
+# =============================================================================
+
+@njit(cache=True)
+def _U_single_particle_dhmc(r_i_new, sum_sq_others, sum_r_others, N, D):
+    sq_i = 0.0
+    for d in range(D):
+        sq_i += r_i_new[d] * r_i_new[d]
+    sum_sq = sum_sq_others + sq_i
+    sum_r_sq = 0.0
+    for d in range(D):
+        s = sum_r_others[d] + r_i_new[d]
+        sum_r_sq += s * s
+    return sum_sq + (0.5 / N) * (N * sum_sq - sum_r_sq)
+
+
+@njit(cache=True)
+def _precompute_others(r_flat, i, N, D):
+    sum_sq = 0.0
+    sum_r  = np.zeros(D)
+    for k in range(N):
+        if k == i:
+            continue
+        for d in range(D):
+            v = r_flat[k * D + d]
+            sum_sq   += v * v
+            sum_r[d] += v
+    return sum_sq, sum_r
+
+
+@njit(cache=True)
+def _find_crossing(r_flat, p_i, i, N, D, E_lo, E_hi, t_max,
+                   sum_sq_others, sum_r_others,
+                   tol=1e-10, max_iter=60):
+    r_i_end = np.empty(D)
+    for d in range(D):
+        r_i_end[d] = r_flat[i * D + d] + t_max * p_i[d]
+    U_end = _U_single_particle_dhmc(r_i_end, sum_sq_others, sum_r_others, N, D)
+    u_calls = 1
+    bisect_iters = 0
+    crossed_lo = U_end < E_lo
+    crossed_hi = U_end > E_hi
+    if not crossed_lo and not crossed_hi:
+        return -1.0, False, False, u_calls, bisect_iters
+    t_lo, t_hi = 0.0, t_max
+    r_i_base = np.empty(D)
+    for d in range(D):
+        r_i_base[d] = r_flat[i * D + d]
+    for _ in range(max_iter):
+        t_mid = 0.5 * (t_lo + t_hi)
+        r_i_mid = np.empty(D)
+        for d in range(D):
+            r_i_mid[d] = r_i_base[d] + t_mid * p_i[d]
+        U_mid = _U_single_particle_dhmc(r_i_mid, sum_sq_others, sum_r_others, N, D)
+        u_calls      += 1
+        bisect_iters += 1
+        if crossed_hi:
+            if U_mid > E_hi: t_hi = t_mid
+            else:            t_lo = t_mid
+        else:
+            if U_mid < E_lo: t_hi = t_mid
+            else:            t_lo = t_mid
+        if t_hi - t_lo < tol:
+            break
+    return 0.5 * (t_lo + t_hi), crossed_lo, crossed_hi, u_calls, bisect_iters
+
+
+@njit(cache=True)
+def _reflect_refract(p_i, grad_i, delta_log_g, out_of_range):
+    gnorm_sq = 0.0
+    for d in range(len(grad_i)):
+        gnorm_sq += grad_i[d] * grad_i[d]
+    if gnorm_sq < 1e-28:
+        return p_i.copy(), False
+    gnorm = np.sqrt(gnorm_sq)
+    p_n = 0.0
+    for d in range(len(p_i)):
+        p_n += p_i[d] * grad_i[d]
+    p_n /= gnorm
+    if out_of_range:
+        p_new = p_i.copy()
+        for d in range(len(p_i)):
+            p_new[d] -= 2.0 * p_n * (grad_i[d] / gnorm)
+        return p_new, False
+    discriminant = p_n * p_n - 2.0 * delta_log_g
+    p_new = p_i.copy()
+    if discriminant >= 0.0:
+        p_n_new = np.sign(p_n) * np.sqrt(discriminant)
+        scale   = (p_n_new - p_n) / gnorm
+        for d in range(len(p_i)):
+            p_new[d] += scale * grad_i[d]
+        return p_new, True
+    else:
+        scale = -2.0 * p_n / gnorm
+        for d in range(len(p_i)):
+            p_new[d] += scale * grad_i[d]
+        return p_new, False
+
+
+@njit(cache=True)
+def _dhmc_single_particle(r_flat, p_i, particle_idx, N, D,
+                           log_g, E_min, dE, n_bins, n_steps, step_size,
+                           max_crossings=50, bisect_tol=1e-10):
+    r     = r_flat.copy()
+    p     = p_i.copy()
+    i     = particle_idx
+    E_max = E_min + dE * n_bins
+    total_crossings = 0
+    total_u_calls   = 1
+    total_bisect    = 0
+    valid  = True
+    U_curr = _U_flat(r, N, D)
+
+    sum_sq_others, sum_r_others = _precompute_others(r, i, N, D)
+
+    for _ in range(n_steps):
+        if U_curr < E_min or U_curr > E_max:
+            valid = False; break
+        t_rem = step_size
+        crossings_this_step = 0
+        while t_rem > 1e-14:
+            if crossings_this_step > max_crossings:
+                valid = False; break
+            k = _bin_index(U_curr, E_min, dE, n_bins)
+            if k < 0:
+                valid = False; break
+            E_lo = E_min + k * dE
+            E_hi = E_lo + dE
+            E_lo_eff = E_lo if k > 0        else E_min
+            E_hi_eff = E_hi if k < n_bins-1 else E_max
+            t_star, hit_lo, hit_hi, u_c, b_c = _find_crossing(
+                r, p, i, N, D, E_lo_eff, E_hi_eff, t_rem,
+                sum_sq_others, sum_r_others, bisect_tol)
+            total_u_calls += u_c
+            total_bisect  += b_c
+            if t_star < 0.0:
+                for d in range(D):
+                    r[i * D + d] += t_rem * p[d]
+                r_i_curr = np.empty(D)
+                for d in range(D):
+                    r_i_curr[d] = r[i * D + d]
+                U_curr = _U_single_particle_dhmc(r_i_curr, sum_sq_others, sum_r_others, N, D)
+                total_u_calls += 1
+                t_rem = 0.0
+                break
+            for d in range(D):
+                r[i * D + d] += t_star * p[d]
+            r_i_curr = np.empty(D)
+            for d in range(D):
+                r_i_curr[d] = r[i * D + d]
+            U_curr = _U_single_particle_dhmc(r_i_curr, sum_sq_others, sum_r_others, N, D)
+            total_u_calls += 1
+            k_new        = k + 1 if hit_hi else k - 1
+            out_of_range = (hit_hi and k == n_bins-1) or (hit_lo and k == 0)
+            delta_lg     = 0.0 if out_of_range else (log_g[k_new] - log_g[k])
+            grad_i = _grad_U_particle(r, N, D, i)
+            p, refracted = _reflect_refract(p, grad_i, delta_lg, out_of_range)
+            gnorm_sq = 0.0
+            for d in range(D):
+                gnorm_sq += grad_i[d] * grad_i[d]
+            if gnorm_sq > 1e-28:
+                gnorm  = np.sqrt(gnorm_sq)
+                bsign  = 1.0 if hit_hi else -1.0
+                nudge  = (1e-8 * bsign / gnorm) if (refracted and not out_of_range) \
+                         else (-1e-8 * bsign / gnorm)
+                for d in range(D):
+                    r[i * D + d] += nudge * grad_i[d]
+            r_i_curr = np.empty(D)
+            for d in range(D):
+                r_i_curr[d] = r[i * D + d]
+            U_curr = _U_single_particle_dhmc(r_i_curr, sum_sq_others, sum_r_others, N, D)
+            total_u_calls += 1
+            t_rem -= t_star
+            total_crossings     += 1
+            crossings_this_step += 1
+        if not valid:
+            break
+
+    return r, p, total_crossings, valid, total_u_calls, total_bisect
+
+
+def mh_step_single(r, i, log_g, e_min, dE, n_bins,
+                   n_steps, step_size, momentum_sigma, rng):
+    N, D   = r.shape
+    r_flat = r.ravel().copy()
+    p_i    = rng.normal(0.0, momentum_sigma, size=D)
+    U_old  = _U_flat(r_flat, N, D)
+    k_old  = _bin_index(U_old, e_min, dE, n_bins)
+    H_old  = 0.5 * np.dot(p_i, p_i) + (log_g[k_old] if k_old >= 0 else np.inf)
+    r_new_flat, p_new, _, valid, u_c, b_c = _dhmc_single_particle(
+        r_flat, p_i, i, N, D, log_g, e_min, dE, n_bins, n_steps, step_size)
+    p_new  = -p_new
+    U_new  = _U_flat(r_new_flat, N, D)
+    k_new  = _bin_index(U_new, e_min, dE, n_bins)
+    H_new  = 0.5 * np.dot(p_new, p_new) + (log_g[k_new] if k_new >= 0 else np.inf)
+    u_c   += 2
+    if not valid or np.isinf(H_new) or np.isnan(H_new):
+        return r, False, u_c, b_c
+    if np.log(rng.uniform()) < H_old - H_new:
+        return r_new_flat.reshape(N, D), True, u_c, b_c
+    return r, False, u_c, b_c
+
+
+# =============================================================================
+# WL-DHMC
+# =============================================================================
+
+def wang_landau_dhmc(r_init, e_min, e_max, n_bins,
+                     n_steps, step_size, momentum_sigma,
+                     log_f_init, log_f_final,
+                     flatness, check_interval, seed):
+    rng  = np.random.default_rng(seed)
+    r    = r_init.copy()
+    N, D = r.shape
+    dE   = (e_max - e_min) / n_bins
+
+    log_g    = np.zeros(n_bins)
+    hist_f   = np.zeros(n_bins, dtype=np.int64)
+    hist_all = np.zeros(n_bins, dtype=np.int64)
+
+    centers = np.array([e_min + (k + 0.5) * dE for k in range(n_bins)])
+    dof     = N * D
+    vmask   = centers > 0
+    theory  = (dof / 2.0 - 1.0) * np.log(centers[vmask])
+    theory -= theory.min()
+
+    log_f        = float(log_f_init)
+    stage        = 0
+    total_steps  = 0
+    accepted     = 0
+    mse_history  = []
+    log_g_history= []
+    current_bin  = _bin_index(_U_flat(r.ravel(), N, D), e_min, dE, n_bins)
+    steps_in_bin = 1
+
+    stage_steps   = []
+    stage_times   = []
+    u_per_step_all= []   # average U/step per stage
+
+    t0 = time.time()
+    print(f"\n{'='*60}")
+    print(f"WL-DHMC  N={N}  D={D}  L={n_steps}  step={step_size}  sigma={momentum_sigma}")
+    print(f"  E=[{e_min:.3f}, {e_max:.3f}]  bins={n_bins}  dE={dE:.4f}")
+    print(f"  log_f: {log_f_init} -> {log_f_final}  "
+          f"flatness={flatness}  check_interval={check_interval:,}")
+    print(f"{'='*60}")
+
+    while log_f > log_f_final:
+        print(f"Stage {stage}: log_f = {log_f:.6f}")
+        hist_f[:] = 0
+        steps_this_stage    = 0
+        accepted_this_stage = 0
+        stay_lengths        = []
+        u_calls_stage       = 0
+        bisect_stage        = 0
+        t_stage = time.time()
+
+        while True:
+            i = rng.integers(N)
+            r, acc, u_c, b_c = mh_step_single(r, i, log_g, e_min, dE, n_bins,
+                                               n_steps, step_size, momentum_sigma, rng)
+            accepted            += int(acc)
+            accepted_this_stage += int(acc)
+            total_steps         += 1
+            steps_this_stage    += 1
+            u_calls_stage       += u_c
+            bisect_stage        += b_c
+
+            E_curr = _U_flat(r.ravel(), N, D)
+            k = _bin_index(E_curr, e_min, dE, n_bins)
+            if k >= 0:
+                log_g[k]   += log_f
+                hist_f[k]  += 1
+                hist_all[k]+= 1
+
+            lg = log_g[vmask] - log_g[vmask].min()
+            mse_history.append(float(np.mean((lg - theory) ** 2)))
+
+            if k >= 0 and k != current_bin:
+                stay_lengths.append(steps_in_bin)
+                current_bin  = k
+                steps_in_bin = 1
+            else:
+                steps_in_bin += 1
+
+            if steps_this_stage % check_interval == 0:
+                visited  = hist_f[hist_f > 0]
+                h_min    = int(visited.min()) if len(visited) else 0
+                h_mean   = float(visited.mean()) if len(visited) else 0.0
+                ratio    = h_min / h_mean if h_mean > 0 else 0.0
+                avg_stay = float(np.mean(stay_lengths)) if stay_lengths else float(steps_in_bin)
+                elapsed  = time.time() - t0
+                avg_u    = u_calls_stage / steps_this_stage
+                avg_b    = bisect_stage  / steps_this_stage
+                print(f"  iter {total_steps:>10,} | Hmin {h_min} | "
+                      f"ratio {ratio:.3f} | accept {accepted_this_stage/steps_this_stage:.3f} | "
+                      f"avg_stay {avg_stay:.1f} | MSE {mse_history[-1]:.4f} | "
+                      f"U/step {avg_u:.1f} | bisect/step {avg_b:.1f} | t {elapsed:.1f}s")
+                if ratio >= flatness:
+                    print(f"  >> Stage {stage} passed.")
+                    log_g_history.append(log_g.copy())
+                    break
+
+        stage_steps.append(steps_this_stage)
+        stage_times.append(time.time() - t_stage)
+        u_per_step_all.append(u_calls_stage / steps_this_stage)
+        log_f /= 2.0
+        stage  += 1
+
+    total_time = time.time() - t0
+    print(f"Done. stages={stage}  steps={total_steps:,}  time={total_time:.1f}s")
+    return {
+        "log_g"        : log_g,
+        "hist_all"     : hist_all,
+        "mse_history"  : np.array(mse_history),
+        "centers"      : centers,
+        "total_steps"  : total_steps,
+        "total_time"   : total_time,
+        "stage"        : stage,
+        "stage_steps"  : stage_steps,
+        "stage_times"  : stage_times,
+        "u_per_step"   : float(np.mean(u_per_step_all)),
+        "label"        : f"DHMC  L={n_steps}  step={step_size}",
+    }
+
+
+# =============================================================================
+# Comparison plot: 4 panels
+# =============================================================================
+
+def plot_comparison(res_rdw, res_dhmc, N, D):
+    fig, axes = plt.subplots(1, 4, figsize=(22, 4))
+    fig.suptitle(f"WL Comparison: RDW vs DHMC  |  N={N}  D={D}", fontsize=11)
+
+    centers = res_rdw["centers"]
+    dof     = N * D
+    ref     = (dof / 2.0 - 1.0) * np.log(np.maximum(centers, 1e-300))
+    ref    -= ref.min()
+
+    # --- 1. DOS ---
+    ax = axes[0]
+    for res, color in [(res_rdw, "C0"), (res_dhmc, "C1")]:
+        lg = res["log_g"].copy(); lg -= lg.min()
+        ax.plot(res["centers"], lg, lw=1.5, color=color, label=res["label"])
+    ax.plot(centers, ref, 'r--', lw=1.5, label="Theory")
+    ax.set(xlabel="E", ylabel="ln g(E) [norm]", title="Density of States")
+    ax.legend(fontsize=8)
+
+    # --- 2. Convergence (MSE) ---
+    ax = axes[1]
+    for res, color in [(res_rdw, "C0"), (res_dhmc, "C1")]:
+        mse = res["mse_history"]
+        w   = max(1, len(mse) // 500)
+        sm  = np.convolve(mse, np.ones(w)/w, mode='valid')
+        ax.semilogy(sm, lw=0.9, color=color,
+                    label=f"{res['label']}  ({res['total_steps']:,} steps, {res['total_time']:.0f}s)")
+    ax.set(xlabel="Iteration", ylabel="MSE vs Theory", title="Convergence")
+    ax.legend(fontsize=7)
+
+    # --- 3. f-Reduction Timeline (cumulative steps per stage) ---
+    ax = axes[2]
+    for res, color, marker in [(res_rdw, "C0", "o"), (res_dhmc, "C1", "s")]:
+        ss = res["stage_steps"]
+        xs = list(range(1, len(ss) + 1))
+        ax.plot(xs, ss, color=color, marker=marker, lw=1.5, ms=6,
+                label=f"{res['label']} ({len(ss)} reductions)")
+    ax.set(xlabel="Reduction index", ylabel="Steps per stage",
+           title="f-Reduction Timeline")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- 4. Per-step cost: U/step and time/step ---
+    ax = axes[3]
+    for res, color in [(res_rdw, "C0"), (res_dhmc, "C1")]:
+        ss = res["stage_steps"]
+        st = res["stage_times"]
+        xs = list(range(1, len(ss) + 1))
+        us = [res["u_per_step"]] * len(ss) if isinstance(res["u_per_step"], float) \
+             else res["u_per_step"]
+        # time per step in microseconds
+        t_per_step = [st[j] / ss[j] * 1e6 for j in range(len(ss))]
+        ax.plot(xs, t_per_step, color=color, lw=1.5, marker="^", ms=5,
+                label=f"{res['label']}  U/step={res['u_per_step']:.1f}")
+    ax.set(xlabel="Stage", ylabel="Time per step (μs)",
+       title="Per-step Cost")
+    ax.set_ylim(bottom=0, top=max(t_per_step) * 1.1)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fname = f"wl_compare_N{N}_D{D}.png"
+    plt.savefig(fname, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"Saved: {fname}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    print("Compiling Numba kernels...")
+    _r = np.ones(6)
+    _U_flat(_r, 2, 3)
+    _grad_U_particle(_r, 2, 3, 0)
+    print("Done.\n")
+
+    # --- shared parameters ---
+    N, D           = 100, 3
+    N_BINS         = 100
+    LOG_F_INIT     = 1.0
+    LOG_F_FINAL    = 1e-4
+    FLATNESS       = 0.90
+    CHECK_INTERVAL = 10_000
+    SEED           = 42
+
+    # --- RDW parameters ---
+    RDW_STEP_SIZE  = 1.0
+
+    # --- DHMC parameters ---
+    DHMC_N_STEPS   = 10
+    DHMC_STEP_SIZE = 0.1
+    DHMC_MOM_SIGMA = 1.0
+
+    E_MIN, E_MAX = estimate_energy_range(N, D, low_q=0.005, high_q=0.995, seed=0)
+    r0 = find_initial_config(N, D, E_MIN, E_MAX, seed=1)
+
+    res_rdw = wang_landau_rdw(
+        r0,
+        e_min          = E_MIN,
+        e_max          = E_MAX,
+        n_bins         = N_BINS,
+        step_size      = RDW_STEP_SIZE,
+        log_f_init     = LOG_F_INIT,
+        log_f_final    = LOG_F_FINAL,
+        flatness       = FLATNESS,
+        check_interval = CHECK_INTERVAL,
+        seed           = SEED,
+    )
+
+    res_dhmc = wang_landau_dhmc(
+        r0,
+        e_min          = E_MIN,
+        e_max          = E_MAX,
+        n_bins         = N_BINS,
+        n_steps        = DHMC_N_STEPS,
+        step_size      = DHMC_STEP_SIZE,
+        momentum_sigma = DHMC_MOM_SIGMA,
+        log_f_init     = LOG_F_INIT,
+        log_f_final    = LOG_F_FINAL,
+        flatness       = FLATNESS,
+        check_interval = CHECK_INTERVAL,
+        seed           = SEED,
+    )
+
+    plot_comparison(res_rdw, res_dhmc, N, D)
